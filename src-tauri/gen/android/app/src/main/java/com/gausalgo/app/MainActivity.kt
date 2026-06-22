@@ -1,4 +1,4 @@
-package com.vicco.gausalgo
+package com.gausalgo.app
 
 import android.os.Bundle
 import androidx.activity.enableEdgeToEdge

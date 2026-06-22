@@ -1,4 +1,4 @@
 <resources>
-    <string name="app_name">gausalgo</string>
-    <string name="main_activity_title">gausalgo</string>
+    <string name="app_name">Gaussian Algorithm Solver</string>
+    <string name="main_activity_title">Gaussian Algorithm Solver</string>
 </resources>

@@ -1,6 +1,3 @@
-mod rational;
-mod parser;
-mod gauss;
 mod app;
 
 use app::*;

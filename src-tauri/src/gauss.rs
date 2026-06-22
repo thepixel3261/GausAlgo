@@ -281,7 +281,6 @@ fn compute_solution(data: &[Vec<Rational>], vars: &[String], n: usize, m: usize)
 
     let mut params: Vec<ParametricVar> = Vec::new();
 
-    // Track algebraic expression for each var (coefficients per free var + constant)
     #[derive(Clone)]
     struct ParamExpr {
         coeffs: Vec<Rational>,
@@ -291,7 +290,6 @@ fn compute_solution(data: &[Vec<Rational>], vars: &[String], n: usize, m: usize)
 
     let mut solved_exprs: Vec<Option<ParamExpr>> = vec![None; m];
 
-    // Assign free vars first: var = param (1 * param + 0)
     for (fi, fv) in free_vars.iter().enumerate() {
         let mut coeffs = vec![Rational::zero(); num_free];
         coeffs[fi] = Rational::one();
@@ -300,7 +298,7 @@ fn compute_solution(data: &[Vec<Rational>], vars: &[String], n: usize, m: usize)
 
     for col in (0..m).rev() {
         if basic_vars[col].is_none() {
-            continue; // already handled as free var
+            continue;
         }
         let r = basic_vars[col].unwrap();
         let pivot = data[r][col].clone();
@@ -319,7 +317,6 @@ fn compute_solution(data: &[Vec<Rational>], vars: &[String], n: usize, m: usize)
             }
         }
 
-        // Divide by pivot
         if !pivot.is_one() {
             for fi in 0..num_free {
                 coeffs[fi] = coeffs[fi].clone() / pivot.clone();
@@ -327,7 +324,6 @@ fn compute_solution(data: &[Vec<Rational>], vars: &[String], n: usize, m: usize)
             constant = constant / pivot.clone();
         }
 
-        // Format as string
         let mut parts: Vec<String> = Vec::new();
         for (fi, coeff) in coeffs.iter().enumerate() {
             if coeff.is_zero() { continue; }
@@ -371,7 +367,6 @@ fn compute_solution(data: &[Vec<Rational>], vars: &[String], n: usize, m: usize)
         });
     }
 
-    // Free vars at the bottom
     for (fi, fv) in free_vars.iter().enumerate() {
         params.push(ParametricVar {
             var: vars[*fv].clone(),
@@ -383,5 +378,3 @@ fn compute_solution(data: &[Vec<Rational>], vars: &[String], n: usize, m: usize)
 
     Solution::Parametric(params)
 }
-
-

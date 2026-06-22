@@ -220,7 +220,3 @@ pub fn parse_equation(input: &str) -> Result<NormalizedEquation, String> {
         constant,
     })
 }
-
-
-
-

@@ -1,10 +1,73 @@
 use leptos::prelude::*;
+use leptos::task::spawn_local;
+use serde::{Serialize, Deserialize};
+use js_sys::{Reflect, JsString, Function, Array};
+use wasm_bindgen::{JsCast, JsValue};
 
-#[derive(Clone, Debug)]
-struct NormalizedDisplay {
-    original: String,
-    normalized: String,
+/// Call a Tauri command from WASM via window.__TAURI_INTERNALS__.invoke()
+async fn tauri_invoke<T: serde::de::DeserializeOwned>(cmd: &str, args: &impl serde::Serialize) -> Result<T, String> {
+    let global = js_sys::global();
+    let internals = Reflect::get(&global, &JsString::from("__TAURI_INTERNALS__"))
+        .map_err(|_| "Nicht innerhalb von Tauri ausgeführt".to_string())?;
+    let invoke_val = Reflect::get(&internals, &JsString::from("invoke"))
+        .map_err(|_| "Tauri invoke nicht gefunden".to_string())?;
+    let invoke_fn: Function = invoke_val.dyn_into()
+        .map_err(|_| "invoke ist keine Funktion".to_string())?;
+
+    let args_val = serde_wasm_bindgen::to_value(args)
+        .map_err(|e| e.to_string())?;
+    let cmd_val: JsValue = JsString::from(cmd).into();
+
+    let promise_args = Array::new();
+    promise_args.push(&cmd_val);
+    promise_args.push(&args_val);
+
+    let promise_val = invoke_fn.apply(&internals, &promise_args)
+        .map_err(|e| format!("invoke-Aufruf fehlgeschlagen: {:?}", e))?;
+
+    let promise: js_sys::Promise = promise_val.dyn_into()
+        .map_err(|_| "invoke hat kein Promise zurückgegeben".to_string())?;
+
+    let result = wasm_bindgen_futures::JsFuture::from(promise)
+        .await
+        .map_err(|e| format!("invoke abgelehnt: {:?}", e))?;
+
+    serde_wasm_bindgen::from_value(result)
+        .map_err(|e| e.to_string())
 }
+
+// ── Cross-boundary types (mirrors backend) ──
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct CellVal {
+    num: i64,
+    den: i64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct RowOpInfo {
+    op_type: String,
+    arrow_src: Option<String>,
+    arrow_dst: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct StepInfo {
+    matrix: Vec<Vec<CellVal>>,
+    vars: Vec<String>,
+    row_ops: Vec<RowOpInfo>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct SolveResponse {
+    steps: Vec<StepInfo>,
+    normalized_eqs: Vec<String>,
+    solution_type: String,
+    solution_vars: Vec<String>,
+    solution_values: Vec<String>,
+}
+
+// ── Frontend types ──
 
 #[derive(Clone, Debug)]
 struct StepRowDisplay {
@@ -25,23 +88,44 @@ struct SolutionData {
     value: String,
 }
 
+// ── Helpers ──
+
+fn format_cell(val: &CellVal) -> String {
+    if val.den == 1 {
+        if val.num >= 0 {
+            format!(" {} ", val.num)
+        } else {
+            format!("{}", val.num)
+        }
+    } else {
+        if val.num < 0 {
+            format!("-{}/{}", -val.num, val.den)
+        } else {
+            format!("{}/{}", val.num, val.den)
+        }
+    }
+}
+
+// ── Component ──
+
 #[component]
 pub fn App() -> impl IntoView {
     let (equation_input, set_equation_input) = signal(String::new());
-    let (normalized_eqs, set_normalized_eqs) = signal(Vec::<NormalizedDisplay>::new());
+    let (normalized_eqs, set_normalized_eqs) = signal(Vec::<String>::new());
     let (step_data_list, set_step_data_list) = signal(Vec::<StepData>::new());
     let (current_step, set_current_step) = signal(0usize);
     let (solutions, set_solutions) = signal(Vec::<SolutionData>::new());
     let (error_msg, set_error_msg) = signal(String::new());
     let (show_solution, set_show_solution) = signal(false);
     let (is_parametric, set_is_parametric) = signal(false);
+    let (loading, set_loading) = signal(false);
 
     let total_steps = move || step_data_list.get().len();
 
     let solve = move |_| {
         let input = equation_input.get();
-        let lines: Vec<&str> = input.lines()
-            .map(|l| l.trim())
+        let lines: Vec<String> = input.lines()
+            .map(|l| l.trim().to_string())
             .filter(|l| !l.is_empty())
             .collect();
 
@@ -50,105 +134,79 @@ pub fn App() -> impl IntoView {
             return;
         }
 
-        let mut equations = Vec::new();
-        let mut norm_displays = Vec::new();
-        for line in &lines {
-            match crate::parser::parse_equation(line) {
-                Ok(eq) => {
-                    norm_displays.push(NormalizedDisplay {
-                        original: line.to_string(),
-                        normalized: format_normalized_eq(&eq),
-                    });
-                    equations.push(eq);
+        set_error_msg.set(String::new());
+        set_loading.set(true);
+
+        let lines_clone = lines.clone();
+        spawn_local(async move {
+            match tauri_invoke::<SolveResponse>("solve", &serde_json::json!({ "equations": lines_clone })).await {
+                Ok(resp) => {
+                    set_normalized_eqs.set(resp.normalized_eqs);
+
+                    let step_data: Vec<StepData> = resp.steps.iter().map(|s| {
+                        let n = s.matrix.len();
+                        let rows: Vec<StepRowDisplay> = (0..n).map(|r| {
+                            let mut cells = Vec::new();
+                            for val in &s.matrix[r] {
+                                cells.push(format_cell(val));
+                            }
+                            let op_class = if r < s.row_ops.len() {
+                                match s.row_ops[r].op_type.as_str() {
+                                    "Eliminate" => "op-elim",
+                                    "Swap" => "op-swap",
+                                    _ => "op-none",
+                                }
+                            } else { "op-none" };
+                            StepRowDisplay {
+                                cells,
+                                arrow_src: if r < s.row_ops.len() { s.row_ops[r].arrow_src.clone() } else { None },
+                                arrow_dst: if r < s.row_ops.len() { s.row_ops[r].arrow_dst.clone() } else { None },
+                                op_class: op_class.to_string(),
+                            }
+                        }).collect();
+                        StepData { rows }
+                    }).collect();
+
+                    set_step_data_list.set(step_data);
+                    set_current_step.set(0);
+
+                    match resp.solution_type.as_str() {
+                        "unique" => {
+                            let sol_data: Vec<SolutionData> = resp.solution_vars.into_iter()
+                                .zip(resp.solution_values.into_iter())
+                                .map(|(var, value)| SolutionData { var, value })
+                                .collect();
+                            set_solutions.set(sol_data);
+                            set_is_parametric.set(false);
+                            set_show_solution.set(true);
+                        }
+                        "parametric" => {
+                            let sol_data: Vec<SolutionData> = resp.solution_vars.into_iter()
+                                .zip(resp.solution_values.into_iter())
+                                .map(|(var, value)| SolutionData { var, value })
+                                .collect();
+                            let param_count = sol_data.len();
+                            set_solutions.set(sol_data);
+                            set_is_parametric.set(true);
+                            set_show_solution.set(true);
+                        }
+                        "no_solution" => {
+                            set_solutions.set(vec![SolutionData {
+                                var: "System".to_string(),
+                                value: "Keine Lösung (inkonsistent)".to_string(),
+                            }]);
+                            set_is_parametric.set(false);
+                            set_show_solution.set(true);
+                        }
+                        _ => {}
+                    }
                 }
                 Err(e) => {
-                    set_error_msg.set(format!("Fehler beim Parsen von '{}': {}", line, e));
-                    return;
+                    set_error_msg.set(format!("Fehler: {}", e));
                 }
             }
-        }
-
-        set_normalized_eqs.set(norm_displays);
-        set_error_msg.set(String::new());
-
-        let (matrix, _all_vars) = crate::gauss::AugmentedMatrix::from_equations(&equations);
-        let (steps, solution) = crate::gauss::gaussian_elimination(&matrix);
-
-        let step_data: Vec<StepData> = steps.iter().map(|s| {
-            let n = s.matrix.rows;
-            let mut rows: Vec<StepRowDisplay> = (0..n).map(|r| {
-                let mut cells = Vec::new();
-                for j in 0..s.matrix.cols {
-                    let val = &s.matrix.data[r][j];
-                    cells.push(format_cell(val));
-                }
-                cells.push(format_cell(&s.matrix.data[r][s.matrix.cols]));
-                let op_class = if r < s.row_ops.len() {
-                    match s.row_ops[r].op_type {
-                        crate::gauss::OpType::Eliminate => "op-elim",
-                        crate::gauss::OpType::Swap => "op-swap",
-                        crate::gauss::OpType::NoChange => "op-none",
-                    }
-                } else { "op-none" };
-                StepRowDisplay {
-                    cells,
-                    arrow_src: None,
-                    arrow_dst: None,
-                    op_class: op_class.to_string(),
-                }
-            }).collect();
-
-            for (i, op) in s.row_ops.iter().enumerate() {
-                if i < n {
-                    rows[i].arrow_src = op.arrow_src.clone();
-                    rows[i].arrow_dst = op.arrow_dst.clone();
-                }
-            }
-
-            StepData {
-                rows,
-            }
-        }).collect();
-
-        set_step_data_list.set(step_data);
-        set_current_step.set(0);
-
-        match &solution {
-            crate::gauss::Solution::Unique(sol) => {
-                let sol_data: Vec<SolutionData> = sol.iter().map(|(v, val)| {
-                    SolutionData {
-                        var: v.clone(),
-                        value: if val.is_integer() {
-                            format!("{}", val.num)
-                        } else {
-                            format!("{}", val)
-                        },
-                    }
-                }).collect();
-                set_solutions.set(sol_data);
-                set_is_parametric.set(false);
-                set_show_solution.set(true);
-            }
-            crate::gauss::Solution::Parametric(params) => {
-                let sol_data: Vec<SolutionData> = params.iter().map(|p| {
-                    SolutionData {
-                        var: p.var.clone(),
-                        value: p.expr.clone(),
-                    }
-                }).collect();
-                set_solutions.set(sol_data);
-                set_is_parametric.set(true);
-                set_show_solution.set(true);
-            }
-            crate::gauss::Solution::NoSolution => {
-                set_solutions.set(vec![SolutionData {
-                    var: "System".to_string(),
-                    value: "Keine Lösung (inkonsistent)".to_string(),
-                }]);
-                set_is_parametric.set(false);
-                set_show_solution.set(true);
-            }
-        }
+            set_loading.set(false);
+        });
     };
 
     let prev_step = move |_| {
@@ -187,10 +245,13 @@ pub fn App() -> impl IntoView {
         set_error_msg.set(String::new());
     };
 
+    let placeholder_text = "Geben Sie eine Gleichung pro Zeile ein, z.B.:\n1x + 2 + 3y = 2i + 4\n1*6x + 3/5y - 2/7i = 4*6-2\n3x - y + z = 1";
+
     view! {
         <div class="app-container">
             <header class="app-header">
                 <h1>"Gauß-Algorithmus Löser"</h1>
+                <p class="subtitle">"Lineare Gleichungssysteme lösen · Schritt-für-Schritt-Wiedergabe · Beliebige Variablen"</p>
             </header>
 
             <main class="app-main">
@@ -198,7 +259,7 @@ pub fn App() -> impl IntoView {
                     <h2>"Gleichungen eingeben"</h2>
                     <textarea
                         class="equation-input"
-                        placeholder="Eine Gleichung pro Zeile, z.B.:&#10;1x + 2 + 3y = 2i + 4&#10;1*6x + 3/5y - 2/7i = 4*6-2&#10;3x - y + z = 1"
+                        placeholder={placeholder_text}
                         prop:value=equation_input
                         on:input=move |ev| {
                             set_equation_input.set(event_target_value(&ev));
@@ -207,11 +268,11 @@ pub fn App() -> impl IntoView {
                     ></textarea>
 
                     <div class="button-row">
-                        <button class="btn btn-primary" on:click=solve>
-                                "System lösen"
+                        <button class="btn btn-primary" on:click=solve disabled=move||{loading.get()}>
+                            {move || if loading.get() { "Löse..." } else { "System lösen" }}
                         </button>
                         <button class="btn btn-secondary" on:click=clear_all>
-                                "Zurücksetzen"
+                            "Zurücksetzen"
                         </button>
                     </div>
 
@@ -232,13 +293,11 @@ pub fn App() -> impl IntoView {
                     }
                     view! {
                         <section class="normalize-section">
-                            <h2>"Äquivalenzumformung"</h2>
+                            <h2>"Äquivalente Umformung"</h2>
                             {normals.into_iter().map(|n| {
                                 view! {
                                     <div class="normalize-row">
-                                        <span class="norm-original">{n.original}</span>
-                                        <span class="norm-arrow">" → "</span>
-                                        <span class="norm-normalized">{n.normalized}</span>
+                                        <span class="norm-normalized">{n}</span>
                                     </div>
                                 }
                             }).collect_view()}
@@ -255,13 +314,12 @@ pub fn App() -> impl IntoView {
                     let cur = current_step.get();
                     let total = steps.len();
                     let step = steps[cur].clone();
-
                     let step_rows = step.rows;
                     let cur_plus_one = cur + 1;
 
                     view! {
                         <section class="playback-section">
-                            <h2>"Schritt-für-Schritt-Elimination"</h2>
+                            <h2>"Schrittweise Elimination"</h2>
 
                             <div class="step-counter">
                                 <span class="step-badge">{format!("Schritt {} von {}", cur_plus_one, total)}</span>
@@ -340,7 +398,7 @@ pub fn App() -> impl IntoView {
 
                     view! {
                         <section class="solution-section">
-                            <h2>{if is_param { "Lösungsmenge".to_string() } else { "Lösung".to_string() }}</h2>
+                            <h2>{if is_param { "Lösungsmannigfaltigkeit".to_string() } else { "Lösung".to_string() }}</h2>
                             <div class="solution-grid">
                                 {sols.into_iter().map(|s| {
                                     view! {
@@ -366,47 +424,5 @@ pub fn App() -> impl IntoView {
                 }}
             </main>
         </div>
-    }
-}
-
-fn format_normalized_eq(eq: &crate::parser::NormalizedEquation) -> String {
-    let mut parts = Vec::new();
-    for (var, coeff) in &eq.terms {
-        if coeff.is_zero() { continue; }
-        let abs_c = coeff.abs();
-        let c_str = if abs_c.is_one() { String::new() } else if abs_c.is_integer() { format!("{}", abs_c.num) } else { format!("{}", abs_c) };
-        if coeff.is_negative() {
-            parts.push(format!("-{}{}", c_str, var));
-        } else if parts.is_empty() {
-            parts.push(format!("{}{}", c_str, var));
-        } else {
-            parts.push(format!("+ {}{}", c_str, var));
-        }
-    }
-    let const_str = if eq.constant.is_integer() {
-        format!("{}", eq.constant.num)
-    } else {
-        format!("{}", eq.constant)
-    };
-    if parts.is_empty() {
-        format!("0 = {}", const_str)
-    } else {
-        format!("{} = {}", parts.join(" "), const_str)
-    }
-}
-
-fn format_cell(val: &crate::rational::Rational) -> String {
-    if val.is_integer() {
-        if val.num >= 0 {
-            format!(" {} ", val.num)
-        } else {
-            format!("{}", val.num)
-        }
-    } else {
-        if val.num < 0 {
-            format!("-{}/{}", -val.num, val.den)
-        } else {
-            format!("{}/{}", val.num, val.den)
-        }
     }
 }
