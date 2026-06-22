@@ -1,7 +1,5 @@
-# Tauri + Leptos
+# GausAlgo
 
-This template should help get you started developing with Tauri and Leptos.
+Eine App die ein beliebiges lineares Gleichungssystem löst, Schritt für Schritt
 
-## Recommended IDE Setup
-
-[VS Code](https://code.visualstudio.com/) + [Tauri](https://marketplace.visualstudio.com/items?itemName=tauri-apps.tauri-vscode) + [rust-analyzer](https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer).
+Ich habe diese App für meinen Mathe Unterricht gemacht
